@@ -1,0 +1,187 @@
+#cloud-config
+
+---
+hostname: name
+coreos:
+  etcd2:
+    name: master
+    listen-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    advertise-client-urls: http://0.0.0.0:2379,http://0.0.0.0:4001
+    initial-cluster-token: k8s_etcd
+    listen-peer-urls: http://0.0.0.0:2380,http://0.0.0.0:7001
+    initial-advertise-peer-urls: http://0.0.0.0:2380
+    initial-cluster: master=http://0.0.0.0:2380
+    initial-cluster-state: new
+  units:
+    - name: etcd2.service
+      command: start
+    - name: fleet.service
+      command: start
+    - name: nameservers.network
+      content: |
+        [Network]
+        DNS=8.8.4.4
+        DNS=8.8.8.8
+    - name: flanneld.service
+      command: start
+      drop-ins:
+      - name: 50-network-config.conf
+        content: |
+          [Unit]
+          Requires=etcd2.service
+          [Service]
+          ExecStartPre=/usr/bin/etcdctl set /coreos.com/network/config '{"Network":"10.244.0.0/16", "Backend": {"Type": "vxlan"}}'
+    - name: docker-cache.service
+      command: start
+      content: |
+        [Unit]
+        Description=Docker cache proxy
+        Requires=early-docker.service
+        After=early-docker.service
+        Before=early-docker.target
+
+        [Service]
+        Restart=always
+        TimeoutStartSec=0
+        RestartSec=5
+        Environment="TMPDIR=/var/tmp/"
+        Environment="DOCKER_HOST=unix:///var/run/early-docker.sock"
+        ExecStartPre=-/usr/bin/docker kill docker-registry
+        ExecStartPre=-/usr/bin/docker rm docker-registry
+        ExecStartPre=/usr/bin/docker pull quay.io/devops/docker-registry:latest
+        # GUNICORN_OPTS is an workaround for
+        # https://github.com/docker/docker-registry/issues/892
+        ExecStart=/usr/bin/docker run --rm --net host --name docker-registry \
+            -e STANDALONE=false \
+            -e GUNICORN_OPTS=[--preload] \
+            -e MIRROR_SOURCE=https://registry-1.docker.io \
+            -e MIRROR_SOURCE_INDEX=https://index.docker.io \
+            -e MIRROR_TAGS_CACHE_TTL=1800 \
+            quay.io/devops/docker-registry:latest
+    - name: docker.service
+      command: start
+      drop-ins:
+        - name: 51-docker-mirror.conf
+          content: |
+            [Unit]
+            # making sure that docker-cache is up and that flanneld finished
+            # startup, otherwise containers won't land in flannel's network...
+            Requires=docker-cache.service flanneld.service
+            After=docker-cache.service flanneld.service
+            [Service]
+            Environment=DOCKER_OPTS='--registry-mirror=http://127.0.0.1:5000'
+    - name: vulcan.service
+      command: start
+      content: |
+        [Unit]
+        Description=Vulcan
+        After=docker.service
+
+        [Service]
+        TimeoutStartSec=0
+        ExecStartPre=-/usr/bin/docker kill vulcan1
+        ExecStartPre=-/usr/bin/docker rm vulcan1
+        ExecStartPre=/usr/bin/docker pull mailgun/vulcand:v0.8.0-beta.3
+        ExecStart=/usr/bin/docker run --rm --name vulcan1 -p 80:80 -p 127.0.0.1:8182:8182 mailgun/vulcand:v0.8.0-beta.3 /go/bin/vulcand -apiInterface=0.0.0.0 -interface=0.0.0.0 -etcd=http://$private_ipv4:4001 -port=80 -apiPort=8182
+        ExecStop=/usr/bin/docker kill vulcan1
+    - name: download-kube.service
+      command: start
+      content: |
+        [Unit]
+        After=network-online.target
+        Before=kube-apiserver.service
+        Before=kube-controller-manager.service
+        Before=kube-kubelet.service
+        Before=kube-proxy.service
+        Before=kube-scheduler.service
+        Description=Download Kubernetes Binaries
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+        Requires=network-online.target
+
+        [Service]
+        ExecStartPre=-/usr/bin/mkdir -p /opt/bin
+        ExecStart=/usr/bin/wget -N -P /opt/bin https://storage.googleapis.com/kubernetes-release/release/v1.0.1/bin/linux/amd64/kube-apiserver
+        ExecStart=/usr/bin/wget -N -P /opt/bin https://storage.googleapis.com/kubernetes-release/release/v1.0.1/bin/linux/amd64/kube-controller-manager
+        ExecStart=/usr/bin/wget -N -P /opt/bin https://storage.googleapis.com/kubernetes-release/release/v1.0.1/bin/linux/amd64/kubectl
+        ExecStart=/usr/bin/wget -N -P /opt/bin https://storage.googleapis.com/kubernetes-release/release/v1.0.1/bin/linux/amd64/kube-scheduler
+        ExecStart=/usr/bin/wget -N -P /opt/bin https://storage.googleapis.com/kubernetes-release/release/v1.0.1/bin/linux/amd64/kube-proxy
+        ExecStart=/usr/bin/wget -N -P /opt/bin https://storage.googleapis.com/kubernetes-release/release/v1.0.1/bin/linux/amd64/kubelet
+        ExecStart=/usr/bin/chmod +x /opt/bin/kube-apiserver
+        ExecStart=/usr/bin/chmod +x /opt/bin/kube-controller-manager
+        ExecStart=/usr/bin/chmod +x /opt/bin/kubectl
+        ExecStart=/usr/bin/chmod +x /opt/bin/kube-scheduler
+        ExecStart=/usr/bin/chmod +x /opt/bin/kube-proxy
+        ExecStart=/usr/bin/chmod +x /opt/bin/kubelet
+        RemainAfterExit=yes
+        Type=oneshot
+    - name: kube-apiserver.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes API Server
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+        Requires=etcd2.service docker-cache.service fleet.service docker.service flanneld.service
+        After=etcd2.service docker-cache.service fleet.service docker.service flanneld.service
+
+        [Service]
+        ExecStart=/opt/bin/kube-apiserver \
+        --service-cluster-ip-range=10.100.0.0/16 \
+        --etcd-servers=http://127.0.0.1:4001 \
+        --bind-address=127.0.0.1
+        Restart=on-failure
+        RestartSec=3
+    - name: kube-controller-manager.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Controller Manager
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+        Requires=kube-apiserver.service
+        After=kube-apiserver.service
+
+        [Service]
+        ExecStart=/opt/bin/kube-controller-manager --master=127.0.0.1:8080
+        Restart=on-failure
+        RestartSec=3
+    - name: kube-scheduler.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Scheduler
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+        Requires=kube-apiserver.service
+        After=kube-apiserver.service
+
+        [Service]
+        ExecStart=/opt/bin/kube-scheduler --master=127.0.0.1:8080
+        Restart=on-failure
+        RestartSec=3
+    - name: kube-proxy.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Proxy
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+        Requires=kube-apiserver.service
+        After=kube-apiserver.service
+
+        [Service]
+        ExecStart=/opt/bin/kube-proxy --master=127.0.0.1:8080
+        Restart=on-failure
+        RestartSec=3
+    - name: kube-kubelet.service
+      command: start
+      content: |
+        [Unit]
+        Description=Kubernetes Kubelet
+        Documentation=https://github.com/GoogleCloudPlatform/kubernetes
+        Requires=etcd2.service
+        After=etcd2.service
+
+        [Service]
+        ExecStart=/opt/bin/kubelet \
+        --address=127.0.0.1 \
+        --hostname-override=127.0.0.1 \
+        --api-servers=127.0.0.1:8080
+        Restart=on-failure
+        RestartSec=3
